@@ -1,0 +1,711 @@
+#!/usr/bin/perl  -w
+
+use strict;
+use POSIX qw(WNOHANG);
+use Data::Dumper;
+use VTP::QemuBackRecovery;
+use Storable qw(dclone);
+use VTP::OpLog qw(log log_with_task process);
+use VTP::Exception qw(raise raise_param_exc my_die);
+use VTP::VMPTools;
+use VTP::Cluster;
+use VTP::Tools;
+use VTP::Alert::DoAlert qw(write_alert_to_file);
+use plog;
+
+
+die "please run as root\n" if $> != 0;
+
+exit 1 if(VTP::Tools::get_mode());
+
+VTP::INotify::inotify_init();
+
+my $rpcenv = VTP::RPCEnvironment->init('cli');
+
+$rpcenv->init_request();
+$rpcenv->set_language($ENV{LANG});
+$rpcenv->set_user('admin@vtp');
+
+my $current_node = VTP::INotify::nodename();
+my $repeat = 5;
+my $cancel = 0;
+my $alert_file = "/tmp/auto_backup_alert";
+
+sub get_vmlist{
+	VTP::Cluster::cfs_update();
+	my $vmlist = VTP::Cluster::get_vmlist();
+	return $vmlist->{ ids };
+}
+#将数组连成字符串，数组长度超过3，用“...“表示
+sub join_string {
+	my($array) = @_;
+	return '' if !defined $array;
+	my $string = '';
+	if(scalar(@$array) <= 3) {
+		$string = join(',', @$array);
+	} else {
+		$string = join(',',($array->[0], $array->[1], $array->[2]));
+		$string .= '...';
+	}
+	return $string;
+}
+#检查是否已经加锁
+sub check_lock {
+	my($policyid) = @_;
+	my $filename = "/tmp/$policyid";
+	my $cmd = "lockfile-check $filename";
+	#system退出码非零说明未上锁，0说明上锁了
+	return system($cmd) ? 0 : 1;
+}
+#加锁策略,加锁成功则返回lockfile-touch进程的pid
+#失败则返回0
+sub lock_file {
+	my($policyid) = @_;
+	return 0 if !defined $policyid;
+	my $filename = "/tmp/$policyid";
+	#加锁失败只尝试1次
+	my $cmd = "lockfile-create --retry 1 $filename";
+	#退出码非0加锁失败，0加锁成功
+	if(system($cmd)) {
+		return 0;
+	} 
+	my $pid = fork;
+	if ( !defined($pid) ) { #fork失败
+		lerror( "can't fork worker" );
+		sleep(1);
+	} elsif (!$pid) {#child
+		#更新一下锁，防止锁失效
+		$cmd = "lockfile-touch $filename";
+		system($cmd);
+		exit(0);
+	} else { #parent
+		return get_lockfile_pid($policyid);
+	}
+	
+	return 0;
+}
+#获取更新锁的进程ID
+sub get_lockfile_pid {
+	my($policyid) = @_;
+	return -1 if !defined $policyid;
+	my $filename = "/tmp/$policyid";
+	($filename) = $filename =~ m|(.*)|;
+	my $cmd = "ps auxf|grep lockfile-touch";
+	my $trycount = 3;
+	my $res;
+	my $fileline;
+	for(my $count = 0; $count < $trycount; $count++ ) {
+		eval { $res = VTP::Tools::run_realcmd($cmd); };
+		if($res) {
+			my @array = split('\n', $res); 
+			foreach my $line(@array) {
+				next if ($line !~ m|$filename|);
+				$fileline = $line;
+				last;
+			}
+		}
+		last if($fileline);
+	}
+	
+	my $pid = 0;
+	if($fileline) {
+		(undef, $pid) = split('\s+', $fileline);
+	}
+	return $pid;
+}
+
+#function:解锁策略
+sub unlock_file {
+	my ( $policyid) = @_;
+	return 0 if ( !$policyid );
+	my $lockfile = "/tmp/$policyid";
+	my $pid = get_lockfile_pid($policyid);
+	my $cmd;
+	if($pid ne '-1') {
+		#kill掉锁进程
+		$cmd = "kill -9 $pid";
+		system($cmd);
+	}
+	#解锁
+	$cmd = "lockfile-remove $lockfile";
+	system($cmd);
+	$lockfile = "/tmp/$policyid.lock";
+
+	#检查是否解锁成功
+	die "unlock lock file failed!\n" if ( -f $lockfile );
+} ## end sub unlock_file
+
+#function:锁住所有的策略
+sub lock_policies {
+	my($weekdaypolicies, $hourpolicies, $hour) = @_;
+	my $code = sub {
+		my($hash) = @_;
+		foreach my $policyid(keys %$hash) {
+			#已经加锁了，或者加锁失败了
+			if(check_lock($policyid) || !lock_file($policyid)) {
+				my $policyname = $hash->{$policyid}->{name};
+				eval {
+					VTP::OpLog::log (
+						"自动备份策略", { 'backup' => $policyname, 'starttime' => $hour }, sub{
+						my_die "策略(%s)已经在备份，请延迟策略的持续时间！", $policyname;
+					});
+				};
+				delete $hash->{$policyid};
+			}
+		}
+	};
+	&$code($weekdaypolicies) if defined $weekdaypolicies;
+	&$code($hourpolicies) if defined $hourpolicies;
+}
+#function:检查是否策略里面的虚拟机都备份完了
+#是则，解锁
+sub check_lock_policies {
+	my($weekdaypolicies, $hourpolicies, $policytype) = @_;
+	my $code = sub {
+		my($hash) = @_;
+		foreach my $policyid(keys %$hash) {
+			my $vms = $hash->{$policyid}->{vms};
+			next if(keys %$vms);
+			unlock_file($policyid);
+			delete $hash->{$policyid};
+		}
+	};
+	if($policytype eq 'weekday') {
+		&$code($weekdaypolicies);
+	} else {
+		&$code($hourpolicies);
+	}
+}
+#function:解锁所有的策略
+sub unlock_policies {
+	my($weekdaypolicies, $hourpolicies) = @_;
+	foreach my $policyid(keys %$weekdaypolicies) {
+		unlock_file($policyid);
+	}
+	foreach my $policyid(keys %$hourpolicies) {
+		unlock_file($policyid);;
+	}
+}
+#处理备份超时
+sub deal_backup_timeout {
+	my($timeoutvms, $backupvms, $start_time) = @_;
+	my $end_time = time();
+	my $timeoutpolicys;
+	foreach my $id(keys %$timeoutvms) {
+		my $policyname = $timeoutvms->{$id}->{name};
+		delete $timeoutvms->{$id}->{name};
+		my (@vmsname, $cout);
+		foreach my $vmid(keys %{$timeoutvms->{$id}}) {
+			#备份过，无论成功还是失败，均不计入超时的范围
+			next if($backupvms->{$vmid});
+			my $conf = VTP::QemuServer::load_config($vmid, undef, undef, 1);
+			my $name = defined($conf->{name}) ? $conf->{name} : $vmid;
+			push @vmsname, $name;
+		}
+		if(scalar@vmsname) {
+			my $stringname = join(',', @vmsname);
+			linfo("虚拟机($stringname)超时，未备份");
+			my $messagename = join_string(\@vmsname);
+			eval {
+				VTP::OpLog::log (
+					"自动备份策略", { 'backup' => $policyname, 'starttime' => $start_time }, sub{
+					my_die "备份虚拟机(%s)超时，请延长备份策略(%s)持续时间！", $messagename, $policyname;
+				});
+			};
+			my $hash = {
+				'name' => $policyname,
+				'str' => "备份虚拟机<$messagename>超时，请延长备份策略<$policyname>持续时间（【管理|虚拟机备份与恢复|备份】）！",
+				'stat' => 1,
+			};
+			$timeoutpolicys->{$id} = $hash;
+		}
+        VTP::Alert::DoAlert::write_alert_to_file('auto_backup', $timeoutpolicys)
+            if (defined $timeoutpolicys);
+	}
+	return 1;
+}
+
+#处理备份被取消
+sub deal_backup_cancel {
+	my($hourbackup, $weekdaybackup, $backupvms, $backhash, $start_time) = @_;
+	my $policyhash;
+	my $code = sub {
+		my($hash) = @_;
+		foreach my $vmid(keys %$hash) {
+			next if($backupvms->{$vmid});
+			my $id = $hash->{$vmid}->{id};
+			$policyhash->{$id} = 1;
+		}
+	};
+	&$code($hourbackup);
+	&$code($weekdaybackup);
+	#没有策略id
+	return 1 if (!defined $policyhash);
+	my @names;
+	foreach my $policyid(keys %$policyhash) {
+		push @names, $backhash->{$policyid}->{name};
+	}
+	my $policyname;
+	$policyname = join_string(\@names) if(scalar(@names));
+	VTP::OpLog::log (
+		"自动备份策略", { 'backup' => $policyname, 'starttime' => $start_time }, sub{
+		my_die "自动备份任务被取消，策略(%s)中未备份虚拟机本次将不再备份！", $policyname;
+	});
+	return 1;
+}
+
+sub check_backup_enable {
+	my $back_conf = VTP::QemuBackRecovery::read_backup();
+	my $global_info = $back_conf->{global};
+	#全局备份功能未启动，不备份
+	return (exists $global_info->{enable} && $global_info->{enable}) ? 1 : 0;
+}
+#funct：对普通虚拟机做备份
+#成功返回0，失败返回$vmid
+sub do_vm_backup{
+	my ( $hostid, $vmid, $times ) = @_;
+	my $conf = VTP::QemuServer::load_config( $vmid );
+	my $errmsg = "";
+	my $outmsg = "";
+	my $cmd = [ "/usr/bin/vtpsh", "create", "/nodes/$hostid/qemu/$vmid/backup" ];
+	my $starttime = time();
+	eval {
+			VTP::Tools::run_command($cmd, 
+			outfunc => sub {$outmsg .= shift . "\n";},
+			errfunc => sub {$errmsg .= shift . "\n";
+				});
+	};
+	my $upid = "";
+	if ( $outmsg =~ m/(UPID:([a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?):([0-9A-Fa-f]{8}):([0-9A-Fa-f]{8}):([0-9A-Fa-f]{8}):([^:\s]+):([^:\s]*):([^:\s]+):)$/)
+	{
+		$upid = $1;
+	}else
+	{
+		lerror("outmsg: ($outmsg) has no upid.");
+		lerror("autobackup failed,errmsg:$errmsg");
+		if( $times == $repeat ){
+			log_with_task(
+				"auto_backup_vm",
+				{ vm => $vmid, 'virtual machine' => $conf->{ name }, 'starttime' => $starttime },
+				undef, undef, sub{
+					my_die ("autobackup failed.");
+				},
+			);
+		}
+		return 0;
+	}
+	my $resmsg = VTP::Tools::upid_read_status($upid);
+	if( $resmsg ne "OK" ){
+		$cancel = 1 if($resmsg =~ m|备份任务被取消！|);
+		return 0;
+	} else {
+		return 1;
+	}
+}
+
+sub wait_for_task {
+	my($upid) = @_;
+	die "Invalid param!\n" unless $upid;
+	my $nodename = VTP::INotify::nodename();
+	my $task = VTP::Tools::upid_decode($upid);
+	my $complete = 0;
+	while(1) {
+		my $pid = $task->{pid};
+		if($task->{node} eq $nodename) {
+			my $waitpid = waitpid($pid, WNOHANG);
+			$complete = 1 if ((defined($waitpid) && ( $waitpid == $pid )) || ($waitpid == -1));
+		} else {
+			my $targetip = VTP::Tools::get_hostip($task->{node});
+			my $cmd = ['ssh', "root\@$targetip", 'cat', "/proc/$pid/stat >/dev/null"];
+			eval {
+				VTP::Tools::run_command($cmd);
+			};
+			$complete = ($@ ? 1 : 0);
+		}
+		last if $complete;
+		sleep(2);
+	}
+}
+
+sub get_clustervm_status
+{
+	my ($upid) = @_;
+	my $res;
+	my $outmsg;
+	my $errmsg;
+	my $ret_status;
+    # "UPID:$node:$pid:$pstart:$startime:$dtype:$id:$user"
+    if ( $upid =~
+        m/^UPID:([a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?):([0-9A-Fa-f]{8}):([0-9A-Fa-f]{8}):([0-9A-Fa-f]{8}):([^:\s]+):([^:\s]*):([^:\s]+):$/
+      )
+    {
+        $res->{ node }      = $1;
+        $res->{ pid }       = hex($3);
+        $res->{ pstart }    = hex($4);
+        $res->{ starttime } = hex($5);
+        $res->{ type }      = $6;
+        $res->{ id }        = $7;
+        $res->{ user }      = $8;
+
+    } ## end if ( $upid =~ ...)
+	else {
+        #VTP::Exception::my_die( "unable to parse worker upid '%s'", $upid );
+		return "unable to parse worker upid " . $upid . ".";
+    }
+	if($res->{node} ne $current_node)
+	{
+		my $cmd = [ "/usr/bin/vtpsh", "get", "/nodes/$res->{node}/tasks/${upid}/log" ];
+		eval {
+			VTP::Tools::run_command($cmd, 
+			outfunc => sub {$outmsg .= shift."\n";},
+			errfunc => sub {$errmsg .= shift . "\n";});
+		};
+		if($@)
+		{
+			lerror("get upid '$upid' status failed.errmsg:$errmsg.");
+			return "get upid " . $upid . " status failed. ";
+			
+		}
+
+        if ( $outmsg =~ m/TASK OK/ ) {
+            return 'OK';
+        }
+        elsif ( $outmsg =~ m/TASK ERROR: (.+)/ ) {
+            return $1;
+        }
+        else {
+            return "unexpected status";
+        }
+	}
+	else
+	{
+		$ret_status = VTP::Tools::upid_read_status($upid);
+		return $ret_status;
+	}
+}
+
+#function：对集群虚拟机做备份
+#notes：vmp1.6只做自动快照，不做异地备份
+sub do_clustervm_backup{
+	my ( $vmid, $times ) = @_;
+	
+	my $conf = VTP::QemuServer::load_config( $vmid );
+	my $cmd = [ "/usr/bin/vtpsh", "create", "/cluster/qemu/$vmid/backup"];
+	my $ret = '';
+	my $errmsg = '';
+	my $outmsg = '';
+	my $upid = "";
+	my $starttime = time();
+	eval {
+			VTP::Tools::run_command($cmd, 
+			outfunc => sub {$outmsg .= shift . "\n";},
+			errfunc => sub {$errmsg .= shift . "\n";
+				});
+	};
+
+	if ( $outmsg =~ m/(UPID:([a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?):([0-9A-Fa-f]{8}):([0-9A-Fa-f]{8}):([0-9A-Fa-f]{8}):([^:\s]+):([^:\s]*):([^:\s]+):)$/)
+	{
+		$upid = $1;
+	}else
+	{
+		lerror("outmsg: ($outmsg) has no upid.");
+		lerror("autobackup failed,errmsg:$errmsg");
+		if( $times == $repeat ){
+			log_with_task(
+				"auto_clustervm_backup",
+				{ vm => $vmid, 'virtual machine' => $conf->{ name }, 'starttime' => $starttime },
+				undef, undef, sub{
+					my_die ("autobackup failed.");
+				},
+			);
+		}
+		return 0;
+	}
+	
+	wait_for_task($upid);
+	
+	my $resmsg = get_clustervm_status($upid);
+	if($resmsg ne 'OK') {
+		$cancel = 1 if($resmsg =~ m|备份任务被取消！|);
+		return 0;
+	} else {
+		return 1;
+	}
+}
+
+#将虚拟机列表按时间排序
+#backvms:虚拟机备份信息
+sub sort_vm_by_time {
+	my($backvms) = @_;
+	my ($nobackuphash, $backuphash);
+	foreach my $vmid(keys %$backvms) {
+		my $tmphash = dclone($backvms->{$vmid});
+		$tmphash->{vmid} = $vmid;
+		#如果有备份时间
+		if($backvms->{$vmid}->{backuptime}) {
+			push @$backuphash, $tmphash;
+		} else {
+			push @$nobackuphash, $tmphash;
+		}
+	}
+	$backuphash = VTP::Tools::sort_array($backuphash, undef, undef, 'backuptime');
+	return ($nobackuphash, $backuphash);
+}
+#将结构中非策略ID和虚拟机ID结构删除
+#返回虚拟机ID列表
+sub get_backup_info {
+	my $backhash;
+	my $backupconf = VTP::QemuBackRecovery::read_backup();
+	my $common = ['global', 'new_vms', 'vtpversion'];
+	my $vmlist = VTP::Tools::read_cfs_vmlist();
+	foreach my $item (keys %$backupconf){
+		next if ($item ~~ @$common);
+		# 将所有的vmid放到vms
+		if( VTP::JSONSchema::vtp_verify_vmid( $item, 1 ) ) {
+			#不是集群中的vmid,则next掉
+			next if(! exists $vmlist->{ids}->{$item});
+			#虚拟机使用的策略id
+			my $id = $backupconf->{$item}->{id};
+			#如果策略id不存在，则直接next掉
+			next if (! exists $backupconf->{$id});
+			#如果策略是未启用状态，则直接next掉
+			next if (! $backupconf->{$id}->{enable});
+			#不是本机上的虚拟机
+			if ($current_node ne $vmlist->{ids}->{$item}->{node}) {
+				#不是集群虚拟机，则直接next
+				next if($vmlist->{ids}->{$item}->{node} ne 'cluster');
+			}
+			my $hash = dclone($backupconf->{$item});
+			if(! exists $backhash->{$id}) {
+				my $policyhash = dclone($backupconf->{$id});
+				$backhash->{$id} = $policyhash;
+			} 
+			$backhash->{$id}->{vms}->{$item} = $hash;
+		}
+	}
+	return $backhash;
+}
+
+my $intervalhash = {
+	2 => [0,2,4,6,8,10,12,14,16,18,20,22],
+	3 => [0,3,6,9,12,15,18,21],
+	4 => [0,4,8,12,16,20],
+	6 => [0,6,12,18],
+	8 => [0,8,16],
+	12 =>[0,12],
+};
+#function:获取需要备份的虚拟机
+#backupinfo:备份信息
+sub get_backup_policy {
+	my($backhash, $hour, $weekday) = @_;
+	my ($weekdaybackup, $hourbackup);
+	#检查每一条策略是否要备份
+	foreach my $policyid(keys %$backhash){
+		#按周备份的开始时间
+		my $starttime = $backhash->{$policyid}->{'starttime'};
+		#按小时备份的小时时间
+		my $tmphour = $backhash->{$policyid}->{'hour'};
+		#按周备份的周几
+		my $tmpweekday = $backhash->{$policyid}->{'weekday'};
+		#按周备份
+		if( defined($tmpweekday) && $tmpweekday ne '-1' ) {
+			#起始时间不对
+			next if($starttime ne $hour);
+			#星期几不对
+			next if($tmpweekday !~ m/$weekday/);
+			$weekdaybackup->{$policyid} = dclone($backhash->{$policyid});
+		} elsif (defined($tmphour) && $tmphour ne '-1') { #按小时备份
+			#每隔0个小时，则不备份，此种为异常
+			next if (!$tmphour);
+			#不能被24整除的则不备份
+			next if (24 % $tmphour);
+			if($tmphour != 1) {
+				#每隔的时间
+				my $interarray = $intervalhash->{$tmphour};
+				#当前小时不在里面，则跳出
+				next if (!($hour ~~ @$interarray));
+			}
+			$hourbackup->{$policyid} = dclone($backhash->{$policyid});
+		}
+	}
+	return ($weekdaybackup, $hourbackup);
+}
+#获取策略中所有的虚拟机
+sub get_vms {
+	my($weekdaybackup, $hourbackup) = @_; 
+	my($weekdayvms, $hourvms);
+	foreach my $policyid(keys %$weekdaybackup) {
+		my $tmpvms = dclone($weekdaybackup->{$policyid}->{vms});
+		foreach my $vmid(keys %$tmpvms) {
+			$weekdayvms->{$vmid} = $tmpvms->{$vmid};
+		}
+	}
+	foreach my $policyid(keys %$hourbackup) {
+		my $tmpvms = dclone($hourbackup->{$policyid}->{vms});
+		foreach my $vmid(keys %$tmpvms) {
+			$hourvms->{$vmid} = $tmpvms->{$vmid};
+		}
+	}
+	return($weekdayvms, $hourvms);
+}
+#返回值
+#1成功0失败
+#vmid
+my $exec_code = sub {
+	my ( $vmid, $vm_conf, $times ) = @_;
+	my $is_success;
+	my $vm_name = $vm_conf->{ name };
+	my $hostid = $vm_conf->{ node };
+	#处理集群虚拟机，主控负责集群虚拟机备份
+	if( $hostid eq 'cluster' 
+		&& VTP::Tools::check_master( $current_node ) ){
+		eval { 
+			$is_success = do_clustervm_backup( $vmid, $times ); 
+		};
+		if( $is_success ){
+			linfo "exec clstervm($vmid:$vm_name ) auto backup ok";
+			return 1;
+		}
+		else{
+			lerror "exec clstervm($vmid:$vm_name ) auto backup failed";
+			return 0;
+		}
+	}
+	
+	return 0 unless( $hostid eq $current_node );	
+	
+	eval { 
+		$is_success = do_vm_backup( $hostid, $vmid, $times ); 
+	};
+	
+	if( $is_success ){
+		linfo "exec vm($vmid:$vm_name) backup ok";
+		return 1;
+	}
+	else{
+		lerror "exec vm($vmid:$vm_name) backup failed";
+		return 0;
+	}
+};
+
+##虚拟机自动备份功能
+##成功返回1
+##失败返回
+sub auto_backup {
+	my $start_time = time();
+	my ( undef, undef, $hour, undef, undef, undef, $weekday, undef, undef ) 
+		= localtime( $start_time );
+
+	#全局备份功能未启动，不备份
+	return if !check_backup_enable();
+	my $vmlist = get_vmlist();
+	return unless defined($vmlist);
+	#只备份运行位置在本机的虚拟机
+	my $backhash = get_backup_info();
+	#以策略ID分类
+	my ($weekdaypolicies, $hourpolicies) = get_backup_policy($backhash,  $hour, $weekday);
+	lock_policies($weekdaypolicies, $hourpolicies, $start_time);
+	my($weekdaybackup, $hourbackup) = get_vms($weekdaypolicies, $hourpolicies);
+	my ($timeoutvms, $backupvms);
+	my $hb_code = sub {
+		my($vmid, $time) = @_;
+		my $is_success = &$exec_code($vmid, $vmlist->{$vmid}, $time);
+		#成功则从按小时备份中将其删除掉
+		if($is_success) {
+			my $policyid = $hourbackup->{$vmid}->{id};
+			delete $hourpolicies->{$policyid}->{vms}->{$vmid};
+			delete $hourbackup->{$vmid};
+		}
+	};
+	my $wk_code = sub {
+		my($vmid, $time) = @_;
+		my $policyid = $weekdaybackup->{$vmid}->{id};
+		my $duration = int($backhash->{$policyid}->{durtime}) * 3600;
+		if((time() - $start_time) > $duration) {
+			$timeoutvms->{$policyid}->{$vmid} = 1;;
+			$timeoutvms->{$policyid}->{name} = $backhash->{$policyid}->{name};
+			delete $weekdaypolicies->{$policyid}->{vms}->{$vmid};
+			delete $weekdaybackup->{$vmid};
+		} else {
+			$backupvms->{$vmid} = 1;
+			my $is_success = &$exec_code($vmid, $vmlist->{$vmid}, $time);
+			#成功则从备份存储中将其删除掉
+			if($is_success) {
+				delete $weekdaypolicies->{$policyid}->{vms}->{$vmid};
+				delete $weekdaybackup->{$vmid}
+			}
+		}
+	};
+	#所有要备份的虚拟机
+	for( my $i = 0; $i < $repeat; $i++ ) {
+		#被取消了
+		last if($cancel);
+		my ($nb_hour, $b_hour) = sort_vm_by_time($hourbackup);
+		my ($nb_weekday, $b_weekday) = sort_vm_by_time($weekdaybackup);
+		my $times = $i + 1;
+		#优先级1：备份按小时未备份的虚拟机
+		foreach my $item(@$nb_hour) {
+			#被取消了
+			last if($cancel);
+			&$hb_code($item->{vmid}, $times);
+			check_lock_policies($weekdaypolicies, $hourpolicies, 'hour');
+		}
+		#优先级2：备份按天未备份的虚拟机
+		foreach my $item(@$nb_weekday) {
+			#被取消了
+			last if($cancel);
+			&$wk_code($item->{vmid}, $times);
+			check_lock_policies($weekdaypolicies, $hourpolicies, 'weekday');
+		}
+		#优先级3：备份按小时已经备份过的虚拟机
+		foreach my $item(@$b_hour) {
+			#被取消了
+			last if($cancel);
+			&$hb_code($item->{vmid}, $times);
+			check_lock_policies($weekdaypolicies, $hourpolicies, 'hour');
+		}
+		#优先级4：备份按天已经备份过的虚拟机
+		foreach my $item(@$b_weekday) {
+			#被取消了
+			last if($cancel);
+			&$wk_code($item->{vmid}, $times);
+			check_lock_policies($weekdaypolicies, $hourpolicies, 'weekday');
+		}
+	}
+	unlock_policies($weekdaypolicies, $hourpolicies);
+	return deal_backup_cancel($hourbackup, $weekdaybackup, $backupvms, $backhash, $start_time) if $cancel;
+	return deal_backup_timeout($timeoutvms, $backupvms, $start_time) if $timeoutvms;
+	return 1;
+}
+my $alert_lock_file = '/tmp/alert_lock';
+#function:将告警信息写入到文件
+#alert_hash:告警内容的hash
+sub write_alert_file {
+	my ($alert_hash) = @_;
+	my_die "write_alert_file：参数错误！" unless(ref($alert_hash) && (ref($alert_hash) eq 'HASH'));
+	my $code = sub {
+		#告警文件不存在
+		if(! -e $alert_file) {
+			VTP::Tools::run_command("touch $alert_file");
+		}
+		eval {
+			my %ini;
+			my $object = tie %ini, 'Config::IniFiles', (-file=>$alert_file, -allowempty => 1);
+			my_die "打开备份配置文件失败！" unless defined($object);
+			foreach my $id(keys %$alert_hash) {
+				$ini{$id} = $alert_hash->{$id};
+			}
+			tied(%ini)->WriteConfig("$alert_file") || 
+			die "Could not write settings to new file.";
+		};
+		if(my $err = $@) {
+			lerror("write alert file failed: $err");
+			my_die "更新告警配置文件失败！ %s", $err;#已经翻译
+		}
+	};
+	my $timeout = 10;
+	VTP::Tools::lock_file( $alert_lock_file, $timeout, $code );
+}
+
+auto_backup();
+exit(0);

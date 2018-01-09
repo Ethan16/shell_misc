@@ -1,0 +1,44 @@
+#井号行的资源被过滤掉
+#wget -c --ftp-user=vtt --ftp-password=123 $address
+#Windows系统
+ftp://200.200.164.111/01-ISO/Windows/01-winXP/winxp_x86_cn_pro_sp2_BX6HT-MDJKW-H2J4X-BX67W-TVVFG.iso
+#ftp://200.200.164.111/01-ISO/Windows/01-winXP/en_win_xp_pro_x64_with_sp2__B66VY-4D94T-TPPD4-43F72-8X4FY.iso
+ftp://200.200.164.111/01-ISO/Windows/02-win7/cn_windows_7_ultimate_x86_dvd_x15-65907.iso
+ftp://200.200.164.111/01-ISO/Windows/02-win7/cn_windows_7_ultimate_x64_dvd_x15-66043.iso
+ftp://200.200.164.111/01-ISO/Windows/04-win10/Windows10_x86_ch.iso
+ftp://200.200.164.111/01-ISO/Windows/04-win10/cn_windows_10_multiple_editions_x64_dvd_6848463.iso
+#ftp://200.200.164.111/01-ISO/Windows/04-win2003/win_2003_SP2_Enterprise_CN.iso
+#ftp://200.200.164.111/01-ISO/Windows/04-win2003/cn_win_srv_2003_r2_standard_x64_with_sp2_vl_cd1_X13-47363.iso
+#ftp://200.200.164.111/01-ISO/Windows/04-win2003/cn_win_srv_2003_r2_standard_x64_with_sp2_vl_cd2_X13-28819.iso
+#ftp://200.200.164.111/01-ISO/Windows/06-win2008/WindowsServer2008_x86.iso
+ftp://200.200.164.111/01-ISO/Windows/06-win2008/cn_windows_server_2008_r2_enterprise_sp1_x64.iso
+ftp://200.200.164.111/01-ISO/Windows/07-win2012/cn_windows_2012_r2_x64__NB4WH-BBBYV-3MPPC-9RCMV-46XCB.iso
+#Linux系统
+#ftp://200.200.164.111/01-ISO/Linux/ubuntu/16/ubuntu-16.04-desktop-amd64.iso
+#ftp://200.200.164.111/01-ISO/Linux/ubuntu/16/ubuntukylin-16.04-desktop-amd64.iso
+#ftp://200.200.164.111/01-ISO/Linux/ubuntu/15/ubuntu-15.10-desktop-amd64.iso
+#ftp://200.200.164.111/01-ISO/Linux/ubuntu/14/ubuntu-14.04.2-desktop-amd64.iso
+#ftp://200.200.164.111/01-ISO/Linux/ubuntu/14/ubuntu-14.04.2-server-amd64+mac.iso
+#ftp://200.200.164.111/01-ISO/Linux/ubuntu/14/ubuntu-14.10-desktop-amd64.iso
+#ftp://200.200.164.111/01-ISO/Linux/ubuntu/14/ubuntukylin-14.04-desktop-amd64.iso
+#ftp://200.200.164.111/01-ISO/Linux/ubuntu/13/ubuntu-13.10-server-amd64.iso
+#ftp://200.200.164.111/01-ISO/Linux/ubuntu/12/12.10/ubuntu-12.10-server-amd64.iso
+#ftp://200.200.164.111/01-ISO/Linux/ubuntu/12/12.04/ubuntu-12.04.5-desktop-amd64.iso
+#ftp://200.200.164.111/01-ISO/Linux/ubuntu/12/12.04/ubuntu-12.04.5-server-amd64.iso
+#ftp://200.200.164.111/01-ISO/Linux/CentOS/CentOS-7-x86_64-DVD-1511.iso
+#ftp://200.200.164.111/01-ISO/Linux/RedHat/rhel-server-7.2-x86_64-dvd.iso
+#ftp://200.200.164.111/01-ISO/Linux/debian/debian-8.5.0-amd64-CD-1.iso
+#ftp://200.200.164.111/01-ISO/Linux/fedora/Fedora-20-x86_64-DVD.iso
+#ftp://200.200.164.111/01-ISO/Linux/suse/SLES-11-SP3-DVD-x86_64-GM-DVD1.iso
+#ftp://200.200.164.111/01-ISO/Linux/suse/SLE-12-Server-DVD-x86_64-GM-DVD1.iso
+#VDI数据中心使用:scp root@200.201.188.106:/sf/data/vs_rep2/iso/cn_windows_server_2012_r2_with_update_x64_dvd_6052725.iso /sf/data/vs_rep2/iso
+#scp root@200.201.136.103:/sf/data/local/iso/cn_windows_server_2012_r2_with_update_x64_dvd_6052725.iso /sf/data/vs_rep2/iso
+#英文系统
+ftp://200.200.164.111/01-ISO/Windows/windows_EN/en_ws_2003_std_x64_vl_PCGCG-MP77F-9DBC9-QHW44-TDBRD.iso
+ftp://200.200.164.111/01-ISO/Windows/windows_EN/en_sbs_2003_std_sp1_disc1.iso
+ftp://200.200.164.111/01-ISO/Windows/windows_EN/en_sbs_2003_std_sp1_disc2.iso
+ftp://200.200.164.111/01-ISO/Windows/windows_EN/en_windows_server_2008_datacenter_enterprise_standard_x86_dvd_X14-26710.iso
+ftp://200.200.164.111/01-ISO/Windows/windows_EN/en_windows_server_2008_datacenter_enterprise_standard_x64_dvd_X14-26714.iso
+ftp://200.200.164.111/01-ISO/Windows/windows_EN/en_windows_server_2008_r2_standard_enterprise_datacenter_and_web_with_sp1_vl_build_x64_dvd_617403.iso
+ftp://200.200.164.111/01-ISO/Windows/windows_EN/en_windows_server_2012_r2_x64_dvd_2707946.iso
+ftp://200.200.164.111/01-ISO/Windows/windows_EN/en_windows_server_2012_x64_dvd_915478_VDNYM-JBKJ7-DC4X9-BT3QR-JHRGY.iso
